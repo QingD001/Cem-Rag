@@ -1,0 +1,12 @@
+# Core dependencies
+torch>=2.0.0
+transformers>=4.30.0
+numpy>=1.24.0
+tqdm>=4.65.0
+
+# Evaluation
+mteb>=1.0.0  # May need to install from source for LongEmbed support: pip install git+https://github.com/embeddings-benchmark/mteb.git
+
+# Existing dependencies (if any)
+zstandard>=0.21.0
+
