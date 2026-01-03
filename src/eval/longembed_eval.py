@@ -26,94 +26,16 @@ import json
 import logging
 from typing import Dict, List, Optional
 
-try:
-    # Use MTEB class (mteb.evaluate doesn't support custom model classes well)
-    # We'll use MTEB class with task objects instead of task names
-    from mteb import MTEB, get_task
-except ImportError:
-    print("Error: mteb is not installed. Please install it with:")
-    print("  pip install mteb")
-    print("\nFor LongEmbed support, you may need to install from source:")
-    print("  pip install git+https://github.com/embeddings-benchmark/mteb.git")
-    sys.exit(1)
+from mteb import evaluate as mteb_evaluate, get_task
+from mteb.cache import ResultCache
 
 # Import Qwen embedding model from models module
 from src.models.qwen_embedding import QwenEmbeddingModel
+from src.models.e5_mistral_embedding import E5MistralEmbeddingModel
+from src.utils import flatten_results_directory, log_gpu_memory, sort_top_level_keys
 
 # Get logger (configuration should be done in main() or entry point)
 logger = logging.getLogger(__name__)
-
-
-def _flatten_results_directory(output_dir: str):
-    """
-    Flatten MTEB results directory structure by moving files from model/revision/ to model/.
-    Also removes the organization prefix from directory names (e.g., Qwen__Qwen3-Embedding-0.6B -> Qwen3-Embedding-0.6B).
-    
-    Structure before: results/Qwen__Qwen3-Embedding-0.6B/no_revision_available/file.json
-    Structure after:  results/Qwen3-Embedding-0.6B/file.json
-    """
-    output_path = Path(output_dir)
-    if not output_path.exists():
-        return
-    
-    # Find all model directories
-    for model_dir in output_path.iterdir():
-        if not model_dir.is_dir() or model_dir.name.startswith('.'):
-            continue
-        
-        # Remove organization prefix (e.g., "Qwen__Qwen3-Embedding-0.6B" -> "Qwen3-Embedding-0.6B")
-        # MTEB converts "Qwen/Qwen3-Embedding-0.6B" to "Qwen__Qwen3-Embedding-0.6B"
-        # We want to remove the "Qwen__" prefix
-        original_name = model_dir.name
-        if '__' in original_name:
-            # Split by '__' and take the last part (model name without org prefix)
-            parts = original_name.split('__')
-            if len(parts) >= 2:
-                # Check if the first part looks like an organization name (short, capitalized)
-                # and the rest looks like a model name
-                new_name = '__'.join(parts[1:])  # Join all parts after the first
-                if new_name and new_name != original_name:
-                    new_model_dir = model_dir.parent / new_name
-                    # Rename the directory
-                    model_dir.rename(new_model_dir)
-                    model_dir = new_model_dir
-                    logger.debug(f"Renamed model directory: {original_name} -> {new_name}")
-        
-        # Look for revision subdirectories (like 'no_revision_available' or any other)
-        for revision_dir in model_dir.iterdir():
-            if not revision_dir.is_dir():
-                continue
-            
-            # Move all files from revision subdirectory to model directory
-            moved_any = False
-            for item in revision_dir.iterdir():
-                target = model_dir / item.name
-                if target.exists():
-                    # If target exists, check if it's the same file (same size and mtime)
-                    # If different, log a warning but still overwrite (later revision wins)
-                    if target.is_file() and item.is_file():
-                        target_stat = target.stat()
-                        item_stat = item.stat()
-                        if target_stat.st_size != item_stat.st_size or target_stat.st_mtime != item_stat.st_mtime:
-                            logger.warning(f"Overwriting existing file {target.name} from {revision_dir.name} "
-                                         f"(size: {target_stat.st_size} -> {item_stat.st_size} bytes)")
-                        target.unlink()
-                    elif target.is_dir():
-                        import shutil
-                        logger.warning(f"Overwriting existing directory {target.name} from {revision_dir.name}")
-                        shutil.rmtree(target)
-                
-                item.rename(target)
-                moved_any = True
-            
-            # Remove empty revision directory
-            if moved_any:
-                try:
-                    revision_dir.rmdir()
-                    logger.debug(f"Flattened directory: removed {revision_dir} and moved files to {model_dir}")
-                except OSError:
-                    # Directory not empty, skip
-                    pass
 
 
 def evaluate_longembed(
@@ -144,6 +66,11 @@ def evaluate_longembed(
         output_dir = "results"
     
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Create a custom ResultCache with our output directory as the cache path
+    # This allows mteb.evaluate to save results directly to our desired output directory
+    # instead of the default ~/.cache/mteb/results/
+    custom_cache = ResultCache(cache_path=output_dir)
     
     # Default LongEmbed tasks if not specified
     # According to official LongEmbed repo: https://github.com/dwzhu-pku/LongEmbed
@@ -178,41 +105,144 @@ def evaluate_longembed(
     results_dict = {}
     failed_tasks = []
     
-    for task_obj in task_objects:
+    for idx, task_obj in enumerate(task_objects, 1):
         task_name = task_obj.metadata.name
         logger.info(f"\n{'=' * 80}")
-        logger.info(f"Evaluating {task_name}...")
+        logger.info(f"Evaluating {task_name} ({idx}/{len(task_objects)})...")
         logger.info(f"{'=' * 80}")
         
-        try:
-            # Create a single-task evaluation
-            evaluation = MTEB(tasks=[task_obj])
-            if not hasattr(evaluation, 'tasks') or not evaluation.tasks:
-                evaluation.tasks = [task_obj]
+        # Filter out test_32768 split for synthetic tasks to avoid OOM
+        # This applies to LEMBPasskeyRetrieval and LEMBNeedleRetrieval
+        if "Passkey" in task_name or "Needle" in task_name:
+            # Try to filter splits through different possible attributes
+            filtered = False
+            if hasattr(task_obj, 'evaluation_splits') and task_obj.evaluation_splits:
+                original_splits = list(task_obj.evaluation_splits) if not isinstance(task_obj.evaluation_splits, list) else task_obj.evaluation_splits.copy()
+                # Remove test_32768 split
+                filtered_splits = [s for s in original_splits if s != "test_32768"]
+                if len(filtered_splits) < len(original_splits):
+                    task_obj.evaluation_splits = filtered_splits
+                    filtered = True
+            elif hasattr(task_obj, 'metadata') and hasattr(task_obj.metadata, 'eval_splits'):
+                original_splits = list(task_obj.metadata.eval_splits) if not isinstance(task_obj.metadata.eval_splits, list) else task_obj.metadata.eval_splits.copy()
+                filtered_splits = [s for s in original_splits if s != "test_32768"]
+                if len(filtered_splits) < len(original_splits):
+                    task_obj.metadata.eval_splits = filtered_splits
+                    filtered = True
             
-            # Run evaluation for this task
-            task_results = evaluation.run(
-                model,
-                output_folder=output_dir,
-                overwrite_results=True,
-                batch_size=batch_size,
-                verbosity=0,
+            if filtered:
+                logger.info(f"Skipping test_32768 split for {task_name} to avoid OOM")
+                logger.info(f"Will evaluate splits: {filtered_splits if 'filtered_splits' in locals() else 'N/A'}")
+        
+        try:
+            # Determine model directory name for saving results
+            model_dir_name = None
+            if hasattr(model, 'mteb_model_meta') and model.mteb_model_meta:
+                model_name = getattr(model.mteb_model_meta, 'name', None)
+                if model_name:
+                    model_dir_name = model_name.split('/')[1] if '/' in model_name else model_name
+            
+            if model_dir_name:
+                model_dir = Path(output_dir) / model_dir_name
+                model_dir.mkdir(parents=True, exist_ok=True)
+                task_result_file = model_dir / f"{task_name}.json"
+                
+                # Try to load existing partial results if available
+                # This allows us to preserve results from completed sub-tasks even if later ones fail
+                existing_results = {}
+                if task_result_file.exists():
+                    try:
+                        with open(task_result_file, 'r') as f:
+                            existing_results = json.load(f)
+                        logger.info(f"Found existing results file, will merge with new results")
+                    except (json.JSONDecodeError, IOError) as e:
+                        logger.warning(f"Could not read existing results file: {e}")
+            
+            # Use new mteb.evaluate API instead of deprecated MTEB class
+            # Pass custom_cache to save results directly to our output directory
+            task_results = mteb_evaluate(
+                model=model,
+                tasks=[task_obj],
+                cache=custom_cache,
             )
             
-            # Process results
+            # Process results and save detailed results file
             for task_result in task_results:
                 if task_result.task_name == task_name:
                     results_dict[task_name] = task_result.scores
                     logger.info(f"✓ {task_name} completed successfully")
+                    
+                    # Save detailed task result to JSON file
+                    if model_dir_name:
+                        # Try to get full result data from task_result object
+                        # Check if task_result has a to_dict() method or similar
+                        task_result_data = {}
+                        if hasattr(task_result, 'to_dict'):
+                            task_result_data = task_result.to_dict()
+                        elif hasattr(task_result, '__dict__'):
+                            # Try to serialize the object's attributes
+                            task_result_data = {}
+                            for key, value in task_result.__dict__.items():
+                                try:
+                                    # Try to serialize the value
+                                    json.dumps(value)  # Test if serializable
+                                    task_result_data[key] = value
+                                except (TypeError, ValueError):
+                                    # If not serializable, try to convert
+                                    if hasattr(value, '__dict__'):
+                                        task_result_data[key] = str(value)
+                                    else:
+                                        task_result_data[key] = str(value)
+                        else:
+                            # Fallback: construct from available attributes
+                            task_result_data = {
+                                "task_name": task_name,
+                                "scores": task_result.scores.copy() if hasattr(task_result.scores, 'copy') else dict(task_result.scores),
+                            }
+                            # Add additional metadata if available
+                            for attr in ['description', 'main_score', 'evaluation_time', 'mteb_version', 'dataset_revision']:
+                                if hasattr(task_result, attr):
+                                    task_result_data[attr] = getattr(task_result, attr)
+                        
+                        # Merge with existing results if available (preserve completed sub-tasks)
+                        if existing_results and 'scores' in existing_results and 'scores' in task_result_data:
+                            # Merge scores: new results take precedence, but keep existing sub-tasks that aren't in new results
+                            existing_scores = existing_results.get('scores', {})
+                            new_scores = task_result_data.get('scores', {})
+                            merged_scores = {**existing_scores, **new_scores}  # New overwrites old
+                            task_result_data['scores'] = merged_scores
+                            logger.info(f"Merged with existing results, preserving completed sub-tasks")
+                        
+                        with open(task_result_file, 'w') as f:
+                            json.dump(task_result_data, f, indent=2, default=str)
+                        logger.info(f"Saved detailed result to: {task_result_file}")
+                    
                     break
             
-            # Flatten directory structure: move files from model/revision/ to model/
-            # This removes the unnecessary revision subdirectory
-            _flatten_results_directory(output_dir)
+            # Flatten directory structure: move files from results/model/revision/ to model/
+            # MTEB saves to output_dir/results/{model_name}/{revision}/{task_name}.json
+            # We flatten this to output_dir/{model_name}/{task_name}.json
+            if hasattr(model, 'mteb_model_meta') and model.mteb_model_meta and hasattr(model.mteb_model_meta, 'name'):
+                model_name = model.mteb_model_meta.name
+                flatten_results_directory(output_dir, model_name=model_name)
         
         except Exception as e:
             logger.error(f"✗ {task_name} failed: {e}")
             failed_tasks.append((task_name, str(e)))
+            
+            # Try to save partial results if available (e.g., from MTEB cache)
+            # This is especially useful for tasks with multiple sub-tasks (like LEMBPasskeyRetrieval)
+            # where some sub-tasks may complete before others fail
+            if model_dir_name and task_result_file and task_result_file.exists():
+                try:
+                    # Check if MTEB saved partial results to cache
+                    # MTEB may have saved results even if evaluation failed
+                    with open(task_result_file, 'r') as f:
+                        partial_results = json.load(f)
+                    logger.info(f"Found partial results in {task_result_file}, they are preserved")
+                except (json.JSONDecodeError, IOError):
+                    pass
+            
             continue
     
     # Report failed tasks
@@ -222,29 +252,20 @@ def evaluate_longembed(
             logger.warning(f"  - {task_name}: {error}")
     
     if not results_dict:
-        logger.error("\n" + "=" * 80)
-        logger.error("All tasks failed! Cannot proceed with evaluation.")
-        logger.error("=" * 80)
-        logger.error("\nPossible reasons:")
-        logger.error("  1. Dataset not downloaded (check HuggingFace cache)")
-        logger.error("  2. Network issues preventing dataset download")
-        logger.error("  3. Dataset configuration mismatch")
-        logger.error("\nTo download datasets, you may need to:")
-        logger.error("  - Set HF_TOKEN environment variable for authentication")
-        logger.error("  - Run evaluation with network access enabled")
-        logger.error("  - Check if datasets are available on HuggingFace Hub")
-        return {}  # Return empty dict instead of raising exception
+        return {}  # Return empty dict if all tasks failed
     
     output_dict = {}
     
-    # Check if tasks are synthetic (Needle/Passkey) or real tasks
-    is_synthetic = any("Needle" in task or "Passkey" in task for task in tasks)
+    # Process each task result individually (synthetic vs real tasks)
+    # scores structure: dict[SplitName, list[Scores]] where Scores is dict[str, Any]
+    context_length_list = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
     
-    if is_synthetic:
-        # Synthetic tasks: extract scores for different context lengths
-        # scores structure: dict[SplitName, list[Scores]] where Scores is dict[str, Any]
-        context_length_list = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
-        for key, value in results_dict.items():
+    for key, value in results_dict.items():
+        # Check if this specific task is synthetic (Needle/Passkey)
+        is_synthetic_task = "Needle" in key or "Passkey" in key
+        
+        if is_synthetic_task:
+            # Synthetic tasks: extract scores for different context lengths
             needle_passkey_score_list = []
             for ctx_len in context_length_list:
                 test_key = f"test_{ctx_len}"
@@ -259,10 +280,8 @@ def evaluate_longembed(
                 avg_score = sum([x[1] for x in needle_passkey_score_list]) / len(needle_passkey_score_list)
                 needle_passkey_score_list.append(["avg", avg_score])
                 output_dict[key] = {item[0]: item[1] for item in needle_passkey_score_list}
-    else:
-        # Real tasks: extract ndcg@1 and ndcg@10
-        # scores structure: dict[SplitName, list[Scores]] where Scores is dict[str, Any]
-        for key, value in results_dict.items():
+        else:
+            # Real tasks: extract ndcg@1 and ndcg@10
             split = "test" if "test" in value else "validation"
             if split in value:
                 # value[split] is a list of score dicts, get the first one
@@ -280,33 +299,46 @@ def evaluate_longembed(
         logger.info("\n" + "=" * 80)
         logger.info("Evaluation Summary")
         logger.info("=" * 80)
-        print(json.dumps(output_dict, indent=2))
+        sorted_output = sort_top_level_keys(output_dict)
+        print(json.dumps(sorted_output, indent=2))
         
-        # Show output directory (simplified - just show the directory, not all files)
-        logger.info("\n" + "=" * 80)
-        logger.info("Results saved to:")
-        logger.info("=" * 80)
-        
-        output_path = Path(output_dir)
-        if output_path.exists():
-            # Find model-specific directories
-            model_dirs = [d for d in output_path.iterdir() if d.is_dir() and not d.name.startswith('.')]
-            if model_dirs:
-                for model_dir in sorted(model_dirs):
-                    # Count task result files (exclude model_meta.json)
-                    task_files = [f for f in model_dir.glob("*.json") 
-                                 if f.name != "model_meta.json" and f.is_file()]
-                    if task_files:
-                        logger.info(f"  {model_dir.name}/ ({len(task_files)} task result files)")
-                    else:
-                        logger.info(f"  {model_dir.name}/ (no task results found)")
+        # Save summary to file
+        # flatten_results_directory has already flattened to output_dir/{model_dir_name}/
+        if hasattr(model, 'mteb_model_meta') and model.mteb_model_meta:
+            model_name = getattr(model.mteb_model_meta, 'name', None)
+            if model_name:
+                # Extract model directory name (remove organization prefix if present)
+                model_dir_name = model_name.split('/')[1] if '/' in model_name else model_name
+                model_dir = Path(output_dir) / model_dir_name
+                model_dir.mkdir(parents=True, exist_ok=True)
+                
+                summary_path = model_dir / "summary.json"
+                # Merge with existing summary if it exists
+                if summary_path.exists():
+                    try:
+                        with open(summary_path, 'r') as f:
+                            existing_summary = json.load(f)
+                        # Merge: existing tasks are preserved, new tasks are added/updated
+                        existing_summary.update(output_dict)
+                        output_dict = existing_summary
+                    except (json.JSONDecodeError, IOError) as e:
+                        logger.warning(f"Failed to read existing summary.json: {e}, overwriting")
+                
+                # Sort only top-level keys (task names), preserve nested structure
+                sorted_output = sort_top_level_keys(output_dict)
+                with open(summary_path, 'w') as f:
+                    json.dump(sorted_output, f, indent=2)
+                logger.info(f"Results saved to: {output_dir}/{model_dir_name}")
             else:
-                logger.info(f"  {output_dir}")
+                logger.warning(f"Could not determine model directory name, results not saved to file")
         else:
-            logger.warning(f"  Output directory does not exist: {output_dir}")
+            logger.warning(f"Model metadata not available, results not saved to file")
     else:
         logger.warning("No results to display (all tasks may have failed)")
-        logger.info(f"Check MTEB output directory: {output_dir}")
+    
+    # Log GPU memory after evaluation
+    if hasattr(model, 'device') and model.device.startswith("cuda"):
+        log_gpu_memory(model.device, "GPU memory after evaluation")
     
     return results_dict
 
@@ -327,7 +359,7 @@ def main():
         "--model",
         type=str,
         default="0.6b",
-        help="Model version for Qwen ('0.6b', '4b', '8b') or path to model directory"
+        help="Model version: '0.6b', '4b', '8b' (Qwen models) or 'e5-mistral' (E5-Mistral-7B-Instruct)"
     )
     parser.add_argument(
         "--output-dir",
@@ -367,7 +399,16 @@ def main():
     
     # Initialize model
     project_root = Path(__file__).parent.parent.parent
-    model = QwenEmbeddingModel(version=args.model, device=args.device, project_root=project_root)
+    
+    # Determine which model to use based on model argument
+    if args.model.lower() == "e5-mistral":
+        model = E5MistralEmbeddingModel(device=args.device, project_root=project_root)
+    else:
+        model = QwenEmbeddingModel(version=args.model, device=args.device, project_root=project_root)
+    
+    # Log GPU memory before evaluation
+    if args.device.startswith("cuda") or args.device == "cuda":
+        log_gpu_memory(model.device if hasattr(model, 'device') else args.device, "GPU memory before evaluation")
     
     # Run evaluation
     # evaluate_longembed already prints the summary, no need to print again

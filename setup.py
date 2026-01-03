@@ -14,13 +14,18 @@ setup(
     install_requires=[
         "torch>=2.0.0",
         "transformers>=4.30.0",
-        "numpy>=1.24.0",
+        "numpy>=1.24.0,<2.0.0",  # Pin numpy < 2.0 for compatibility
         "tqdm>=4.65.0",
         "zstandard>=0.21.0",
     ],
     extras_require={
         "eval": [
             "mteb>=1.0.0",
+        ],
+        "dev": [
+            "pytest>=7.0.0",
+            "black>=23.0.0",
+            "flake8>=6.0.0",
         ],
     },
 )

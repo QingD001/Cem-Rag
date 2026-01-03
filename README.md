@@ -335,13 +335,27 @@ cem-rag/
 
 ### 9.2 开发环境设置
 
-#### 安装开发模式
+#### 标准安装方式（推荐）
 
 ```bash
+# 1. 创建虚拟环境（推荐使用 Python 3.11）
+python3.11 -m venv venv
+source venv/bin/activate  # 或 Windows: venv\Scripts\activate
+
+# 2. 安装项目（开发模式）
 pip install -e .
+
+# 3. 安装评估依赖（如果需要运行 LongEmbed 评估）
+pip install -e ".[eval]"
 ```
 
-这会让所有包可以从任何地方导入。
+这会让所有包可以从任何地方导入，并且以开发模式安装，代码修改会立即生效。
+
+#### 可选：安装开发工具
+
+```bash
+pip install -e ".[dev]"
+```
 
 #### 运行测试
 
@@ -388,43 +402,35 @@ LongEmbed benchmark 来自论文 ["LongEmbed: Extending Embedding Models for Lon
 
 ### 10.2 安装依赖
 
-#### 使用虚拟环境（推荐）
+#### 标准安装方式（推荐）
 
-为了避免依赖冲突，建议使用项目专用的虚拟环境：
+使用标准的 Python 包安装方式：
 
 ```bash
-# 创建并设置虚拟环境（使用 Python 3.11）
-bash scripts/setup_venv.sh
+# 1. 创建虚拟环境（推荐使用 Python 3.11）
+python3.11 -m venv venv
+source venv/bin/activate  # 或 Windows: venv\Scripts\activate
 
-# 激活虚拟环境
-# 如果是 conda 环境：
-source ~/anaconda3/etc/profile.d/conda.sh
-conda activate ./venv
-# 如果是标准 venv：
-source venv/bin/activate
+# 2. 升级 pip
+pip install --upgrade pip setuptools wheel
 
-# 安装评测相关依赖（如果需要）
-pip install mteb
+# 3. 安装项目（开发模式，包含评估依赖）
+pip install -e ".[eval]"
 ```
 
-#### 直接安装（不推荐）
+这会自动安装所有核心依赖和评估依赖（包括 mteb）。
+
+#### 如果 LongEmbed 任务不可用
+
+如果安装的 mteb 版本不支持 LongEmbed，可以从源码安装：
 
 ```bash
-# 安装核心依赖
-pip install torch transformers 'numpy<2' tqdm
-
-# 安装 mteb（支持 LongEmbed）
-pip install mteb
-
-# 如果 LongEmbed 任务不可用，从源码安装：
 pip install git+https://github.com/embeddings-benchmark/mteb.git
 ```
 
-或使用安装脚本：
+#### 旧版安装脚本（已废弃）
 
-```bash
-bash scripts/setup_eval.sh
-```
+> ⚠️ **注意**：`scripts/setup_venv.sh` 和 `scripts/setup_eval.sh` 已废弃，推荐使用上述标准安装方式。
 
 ### 10.3 验证安装
 
