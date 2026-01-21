@@ -10,3 +10,7 @@ mteb>=1.0.0  # May need to install from source for LongEmbed support: pip instal
 # Existing dependencies (if any)
 zstandard>=0.21.0
 
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0  # Optional: for coverage reports
+
